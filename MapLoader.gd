@@ -1,47 +1,69 @@
 extends Node2D
 
 # --- Configuration Constants ---
-# Target padding around the map in the viewport (in pixels).
 const PADDING = 50.0 
-# Default aspect ratio if the viewport size is not yet available (e.g., in _ready).
-const FALLBACK_VIEWPORT_SIZE = Vector2(1024.0, 600.0) 
-# Camera Zoom limits
+const FALLBACK_VIEWPORT_SIZE = Vector2(1024.0, 600.0)
 const MIN_ZOOM = 0.5
 const MAX_ZOOM = 3.0
-const ZOOM_SPEED = 0.1
+const ZOOM_FACTOR = 1.1 
+const PAN_BUTTON = MOUSE_BUTTON_RIGHT # Right click for pan
+const PAN_SPEED = 1.0 
+const ZOOM_SMOOTH_SPEED = 10.0 
 
 # Internal variables for calculated transform
 var calculated_scale = 1.0
 var calculated_offset = Vector2.ZERO
+# var owner_colors: Dictionary = {} # REMOVED: Owner coloring moved to external file/system
 
 # Camera Control State
 var is_panning = false
-var pan_start_position = Vector2.ZERO
-var camera: Camera2D = null # Reference to the Camera2D node
+var last_mouse_position = Vector2.ZERO 
+var camera: Camera2D = null 
+var target_zoom = Vector2(1.0, 1.0) 
 
 const DEFAULT_PROVINCE_DATA = {
 	"name": "Unnamed Province",
-	"owner": "Neutral",
+	"owner": "Neutral", # The default owner reference
 	"supply": 10,
 	"units": 0
 }
 
-# --- Initialization ---
+# ----------------------------------------------------------------------
+## Initialization and Map Loading
+# ----------------------------------------------------------------------
+
 func _ready():
-	# Setup Camera
+	# Standard Camera2D Initialization
 	camera = Camera2D.new()
 	add_child(camera)
-	camera.current = true
-	camera.limit_smoothed = true
-	camera.position_smoothing_enabled = true
+	camera.make_current()
+	
+	# Set up for a smooth, immediate snap on load, followed by smooth panning
+	camera.position_smoothing_enabled = false
 	camera.zoom = Vector2(1.0, 1.0)
 	
-	# The map loading process now includes automatic coordinate transformation
 	load_map("res://map.json")
+	
+	target_zoom = camera.zoom 
+	
+	# Re-enable smoothing now that the camera is at the correct position.
+	camera.position_smoothing_enabled = true
+	camera.position_smoothing_speed = 8.0 
+
+# ----------------------------------------------------------------------
+## Zoom Smoothing
+# ----------------------------------------------------------------------
+
+func _process(delta):
+	if camera and camera.zoom != target_zoom:
+		# Smoothly interpolate the camera's zoom towards the target zoom
+		camera.zoom = camera.zoom.lerp(target_zoom, delta * ZOOM_SMOOTH_SPEED)
+
 
 # --- Map Loading and Parsing ---
+
 func load_map(path: String) -> void:
-	# 1. Load and Parse JSON
+	"""Loads, parses, transforms, and draws the map geometry from a GeoJSON file."""
 	if not FileAccess.file_exists(path):
 		push_error("Error: Map file not found at: " + path)
 		return
@@ -52,33 +74,39 @@ func load_map(path: String) -> void:
 
 	var data = JSON.parse_string(json_text)
 
-	if typeof(data) != TYPE_DICTIONARY or data == null:
-		push_error("Error: Failed to parse JSON. Check syntax.")
+	if typeof(data) != TYPE_DICTIONARY or data == null or not data.has("features"):
+		push_error("Error: Failed to parse valid GeoJSON data.")
 		return
 
-	if not data.has("features") or data.get("type") != "FeatureCollection":
-		push_error("Error: JSON is not a valid GeoJSON FeatureCollection.")
-		return
+	var features = data["features"]
 
-	var features = data.features
-	
-	# 2. Automatically Calculate Transform (The new, crucial step)
+	# 1. Calculate the necessary scale and offset based on map bounds
 	calculate_and_set_transform(features)
+	
+	# 2. Draw Provinces (Delegate to the drawing function)
+	_draw_provinces(features) # Simplified call flow
 
-	# 3. Process each feature
+func _draw_provinces(features: Array) -> void:
+	"""Iterates through all GeoJSON features and creates Area2D nodes for them."""
 	for feature in features:
-		var properties = feature.get("properties", {})
+		if feature == null: continue # ROBUSTNESS CHECK: Skip null feature
+		
 		var geometry = feature.get("geometry", {})
+		var properties = feature.get("properties", {})
+		
+		# Skip if geometry is missing or null
+		if geometry == null or not geometry.has("type"): continue
 
 		if geometry.get("type") == "Polygon":
-			create_province(geometry.coordinates, properties)
+			create_province(geometry["coordinates"], properties)
 		elif geometry.get("type") == "MultiPolygon":
-			for polygon_coords in geometry.coordinates:
+			for polygon_coords in geometry["coordinates"]:
 				create_province(polygon_coords, properties)
 
-# --- Automated Transform Calculation ---
+# ----------------------------------------------------------------------
+## Automated Transform Calculation
+# ----------------------------------------------------------------------
 
-# Finds the min/max longitude and latitude across ALL map features.
 func get_map_bounds(features: Array) -> Rect2:
 	var min_lon = INF
 	var max_lon = -INF
@@ -86,7 +114,15 @@ func get_map_bounds(features: Array) -> Rect2:
 	var max_lat = -INF
 
 	for feature in features:
+		if feature == null: continue # ROBUSTNESS CHECK: Skip null feature
+		
+		# If the GeoJSON has {"geometry": null}, feature.get("geometry", {}) will return {}.
+		# We must ensure that we don't proceed if it's invalid.
 		var geometry = feature.get("geometry", {})
+		
+		# Check if geometry is a dictionary and has a type key
+		if typeof(geometry) != TYPE_DICTIONARY or not geometry.has("type"): continue
+
 		var coords_array = geometry.get("coordinates", [])
 
 		var geom_type = geometry.get("type")
@@ -94,15 +130,23 @@ func get_map_bounds(features: Array) -> Rect2:
 
 		if geom_type == "Polygon":
 			if coords_array.size() > 0:
-				rings_to_process.append(coords_array[0]) # Exterior ring
+				# We expect coords_array[0] to be the exterior ring array
+				if coords_array[0] != null: # Robustness against null ring
+					rings_to_process.append(coords_array[0]) 
 		elif geom_type == "MultiPolygon":
 			for polygon in coords_array:
-				if polygon.size() > 0:
-					rings_to_process.append(polygon[0]) # Exterior ring of each polygon
+				if polygon != null and polygon.size() > 0: # Robustness against null polygon
+					# We expect polygon[0] to be the exterior ring array
+					if polygon[0] != null: # Robustness against null ring
+						rings_to_process.append(polygon[0]) 
 
 		for ring_coords in rings_to_process:
+			if ring_coords == null: continue # DEFENSIVE CHECK: Guard against null ring array
 			for coord in ring_coords:
-				if coord.size() >= 2:
+				if coord == null: continue # DEFENSIVE CHECK: Guard against null coordinate
+				
+				# This check prevents calling .size() on Nil
+				if coord.size() >= 2: 
 					var lon = float(coord[0])
 					var lat = float(coord[1])
 					min_lon = min(min_lon, lon)
@@ -110,76 +154,60 @@ func get_map_bounds(features: Array) -> Rect2:
 					min_lat = min(min_lat, lat)
 					max_lat = max(max_lat, lat)
 
-	# Return bounds as Rect2(position, size)
 	var width = max_lon - min_lon
 	var height = max_lat - min_lat
 	return Rect2(min_lon, min_lat, width, height)
 
-# Calculates the necessary scale and offset to center the map in the viewport.
 func calculate_and_set_transform(features: Array) -> void:
+	# ... (rest of function remains unchanged) ...
 	var bounds = get_map_bounds(features)
 
 	if bounds.size.x <= 0 or bounds.size.y <= 0:
 		push_warning("Map bounds are zero or negative. Cannot calculate transform.")
 		return
 
-	# Use viewport size, fall back if not available (e.g., if called too early)
 	var viewport_size = get_viewport_rect().size
 	if viewport_size == Vector2.ZERO:
 		viewport_size = FALLBACK_VIEWPORT_SIZE
 
-	# 1. Calculate Scale
-	# We need to fit the horizontal range (bounds.size.x) and the vertical range (bounds.size.y)
 	var draw_width = viewport_size.x - 2 * PADDING
 	var draw_height = viewport_size.y - 2 * PADDING
 
 	var scale_x = draw_width / bounds.size.x
 	var scale_y = draw_height / bounds.size.y
 
-	# Use the smaller scale factor to ensure the entire map fits within the viewport.
 	calculated_scale = min(scale_x, scale_y)
 
-	# 2. Calculate Offset (for centering)
-	# The projected map size after scaling:
 	var projected_width = bounds.size.x * calculated_scale
 	var projected_height = bounds.size.y * calculated_scale
 
-	# Calculate offset to center the map within the draw area.
-	# Longitude (X): Shift the min_lon coordinate (which becomes the left edge) 
-	# to the screen's center point.
-	var center_x = (viewport_size.x - projected_width) / 2.0
-	calculated_offset.x = center_x - bounds.position.x * calculated_scale
-
-	# Latitude (Y): This is trickier due to the Y-flip. The max_lat (top of the map) 
-	# should land near the top of the viewport.
-	var center_y = (viewport_size.y - projected_height) / 2.0
-	# The Y flip means we calculate based on the MAX latitude coordinate 
-	# landing near the TOP (low Y value) of the screen.
-	calculated_offset.y = center_y + bounds.end.y * calculated_scale
+	# Calculate offset to center the map content relative to the viewport.
+	var map_left_edge_x = (viewport_size.x - projected_width) / 2.0
+	calculated_offset.x = map_left_edge_x - bounds.position.x * calculated_scale
 	
-	# Set the initial camera position to the calculated center offset.
+	var map_top_edge_y = (viewport_size.y - projected_height) / 2.0
+	calculated_offset.y = map_top_edge_y + bounds.end.y * calculated_scale
+	
 	if camera:
-		camera.position = calculated_offset
-	else:
-		# If camera not initialized yet, set the map position itself
-		position = calculated_offset
+		# Set camera position to the CENTER of the mapped area.
+		var map_center_lon = bounds.position.x + bounds.size.x / 2.0
+		var map_center_lat = bounds.position.y + bounds.size.y / 2.0
+		
+		var camera_target_x = map_center_lon * calculated_scale + calculated_offset.x
+		var camera_target_y = -map_center_lat * calculated_scale + calculated_offset.y
+		
+		camera.position = Vector2(camera_target_x, camera_target_y)
 
-	print("\n--- Auto-Calculated Transform Results ---")
-	print("Map Bounds: ", bounds)
-	print("Calculated Scale (Factor): ", calculated_scale)
-	print("Calculated Offset (Vector2): ", calculated_offset)
-	print("---------------------------------------")
-
-# ---
-## Province Creation (Uses calculated_scale and calculated_offset)
+# ----------------------------------------------------------------------
+## Coordinate and Province Creation (Pure Renderer)
+# ----------------------------------------------------------------------
 
 func create_province(nested_coords: Array, properties: Dictionary) -> void:
 	var rings: Array = nested_coords
-	if rings.is_empty():
+	if rings.is_empty() or rings[0] == null:
 		return
 
 	var exterior_coords: Array = rings[0]
-	# NOTE: The convert function now uses the *calculated* global variables
 	var points: PackedVector2Array = convert_coords_to_points(exterior_coords)
 
 	if points.size() < 3:
@@ -188,22 +216,33 @@ func create_province(nested_coords: Array, properties: Dictionary) -> void:
 	var area = Area2D.new()
 	var province_data = DEFAULT_PROVINCE_DATA.duplicate()
 
-	for key in properties:
-		# Temporary logic for uploaded file missing properties:
-		if "id" not in properties:
-			if exterior_coords[0][1] > 50:
-				 province_data.name = "Quebec (Auto)"
-			else:
-				 province_data.name = "Italy (Auto)"
-
-		province_data[key] = properties[key]
+	# --- Owner Identification for Data Storage Only (Not Coloring) ---
+	var owner_name = "Neutral"
+	if properties.has("owner"):
+		owner_name = properties["owner"]
+	elif properties.has("country"):
+		owner_name = properties["country"]
+	elif properties.has("name"):
+		owner_name = properties["name"]
+	
+	province_data.name = properties.get("name", "Unnamed Province")
+	province_data.owner = owner_name # Store the determined owner name
+	# -----------------------------------------------------------------
 
 	area.name = "Province_" + province_data.name
 	area.set_meta("data", province_data)
 
 	var visual_poly = Polygon2D.new()
 	visual_poly.polygon = points
-	visual_poly.color = Color.from_hsv(randf(), 0.8, 1.0)
+	
+	# TEMPORARY COLOR: Apply a simple random color until the Owner Registry 
+	# (external file) can supply the correct, stable color.
+	visual_poly.color = Color.from_hsv(randf(), 0.7, 0.9)
+	
+	visual_poly.z_index = 1 
+	visual_poly.light_mask = 1 
+	visual_poly.self_modulate = Color.WHITE # Ensures unmuted color
+	
 	area.add_child(visual_poly)
 
 	var collision_poly = CollisionPolygon2D.new()
@@ -212,77 +251,83 @@ func create_province(nested_coords: Array, properties: Dictionary) -> void:
 
 	area.input_event.connect(_on_province_clicked.bind(area))
 
-	add_child(area)
-	print("Successfully created: ", province_data.name)
+	add_child(area) 
 
-
-# Helper function for coordinate transformation
 func convert_coords_to_points(coords_array: Array) -> PackedVector2Array:
 	var points: PackedVector2Array = []
 
 	for coord in coords_array:
+		if coord == null: continue # DEFENSIVE CHECK ADDED: Guard against null coordinate
 		if coord.size() >= 2:
 			var lon: float = float(coord[0])
 			var lat: float = float(coord[1])
 
-			# Transformation logic now uses calculated variables
 			var x = lon * calculated_scale + calculated_offset.x
-			var y = -lat * calculated_scale + calculated_offset.y
+			var y = -lat * calculated_scale + calculated_offset.y 
 
 			points.append(Vector2(x, y))
 
-	# NOTE: Debug print statements are moved to the calculation function
 	return points
 
+# ----------------------------------------------------------------------
+## Camera Control and Interaction Handling
+# ----------------------------------------------------------------------
 
-# ---
-## Camera Control and Interaction Handling 
-
-# Captures mouse wheel events for zoom and mouse presses for panning start/stop
 func _unhandled_input(event):
+	if camera == null:
+		return 
+
+	# --- Panning Start/Stop and Zoom ---
 	if event is InputEventMouseButton:
-		# --- Panning Start/Stop (Middle Button for standard GIS/Map interaction) ---
-		if event.button_index == MOUSE_BUTTON_MIDDLE:
+		var handled = false
+		
+		# Panning Start/Stop (Right Mouse Button)
+		if event.button_index == PAN_BUTTON:
+			is_panning = event.pressed
 			if event.pressed:
-				is_panning = true
-				# Get position relative to the camera's viewport
-				pan_start_position = get_viewport().get_mouse_position()
-			else:
-				is_panning = false
+				last_mouse_position = get_viewport().get_mouse_position()
+			handled = true
 		
-		# --- Zoom (Mouse Wheel) ---
-		elif event.button_index == MOUSE_BUTTON_WHEEL_UP:
-			if camera:
-				var new_zoom = camera.zoom.x + ZOOM_SPEED
-				new_zoom = clamp(new_zoom, MIN_ZOOM, MAX_ZOOM)
-				camera.zoom = Vector2(new_zoom, new_zoom)
-				get_viewport().set_input_as_handled()
+		# Zoom (Mouse Wheel)
+		var new_zoom = target_zoom.x 
+		var zoom_changed = false
+		
+		if event.button_index == MOUSE_BUTTON_WHEEL_UP:
+			new_zoom *= ZOOM_FACTOR
+			zoom_changed = true
 		elif event.button_index == MOUSE_BUTTON_WHEEL_DOWN:
-			if camera:
-				var new_zoom = camera.zoom.x - ZOOM_SPEED
-				new_zoom = clamp(new_zoom, MIN_ZOOM, MAX_ZOOM)
-				camera.zoom = Vector2(new_zoom, new_zoom)
-				get_viewport().set_input_as_handled()
-				
-	# Handle the actual mouse movement for panning
+			new_zoom /= ZOOM_FACTOR
+			zoom_changed = true
+			
+		if zoom_changed:
+			new_zoom = clamp(new_zoom, MIN_ZOOM, MAX_ZOOM)
+			target_zoom = Vector2(new_zoom, new_zoom) 
+			handled = true 
+
+		if handled:
+			get_viewport().set_input_as_handled()
+
+
+	# --- Panning Motion ---
 	elif event is InputEventMouseMotion and is_panning:
-		var mouse_current_pos = get_viewport().get_mouse_position()
-		var delta = mouse_current_pos - pan_start_position
+		var current_mouse_position = get_viewport().get_mouse_position()
+		var delta = current_mouse_position - last_mouse_position
 		
-		# Panning moves the camera (which moves the viewport relative to the map)
-		# Multiply by 1/zoom to account for the camera zoom level
-		camera.position -= delta * (1.0 / camera.zoom)
-		pan_start_position = mouse_current_pos
+		# Panning is working correctly here, assuming the mouse input is received.
+		camera.position -= delta * PAN_SPEED / camera.zoom.x
+		
+		last_mouse_position = current_mouse_position
 		get_viewport().set_input_as_handled()
 
-# Dedicated function to reset the province color after a short delay
+# ----------------------------------------------------------------------
+## Province Interaction
+# ----------------------------------------------------------------------
+
 func _reset_province_color(province_poly: Polygon2D, original_color: Color):
-	# Check if the node is still valid before attempting to set the color
 	if is_instance_valid(province_poly):
 		province_poly.color = original_color
 
-func _on_province_clicked(_viewport: Node, event: InputEvent, shape_idx: int, area: Area2D):
-	# Fix 1: Explicitly use self.is_panning
+func _on_province_clicked(_viewport: Node, event: InputEvent, _shape_idx: int, area: Area2D):
 	if not self.is_panning:
 		if event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_LEFT and event.pressed:
 			var data: Dictionary = area.get_meta("data")
@@ -292,10 +337,8 @@ func _on_province_clicked(_viewport: Node, event: InputEvent, shape_idx: int, ar
 				var original_color = visual_poly.color
 				visual_poly.color = Color.WHITE.lerp(original_color, 0.5)
 
-				# Fix 2: Explicitly use self.get_tree()
 				var timer = self.get_tree().create_timer(0.15)
-				# Now using the dedicated function for the callback
 				timer.timeout.connect(_reset_province_color.bind(visual_poly, original_color))
 
 			print("Province clicked: ", data.name)
-			print("  → Owner:", data.owner, " Supply:", data.supply, " Units:", data.units)
+			print(" → Owner:", data.owner, " Supply:", data.supply, " Units:", data.units)
